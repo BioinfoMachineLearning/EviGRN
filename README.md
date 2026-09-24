@@ -1,8 +1,8 @@
 # EviGRN: Evidence-adaptive graph reasoning for Gene Regulatory Network inference
 
-[Source code](https://github.com/aghktb/GRN_Agent)
+[Source code](https://github.com/BioinfoMachineLearning/EviGRN)
 
-![EviGRN overview](docs/figures_and_tables/figures/fig00_overview_evigrn.png)
+![EviGRN overview](docs/fig00_overview_evigrn.png)
 
 Inferring gene regulatory networks (GRNs) from multimodal biological data requires evidence beyond transcript abundance. RNA-seq, chromatin accessibility, and transcription factor (TF) motif priors provide complementary signals, but finding, harmonizing, and assessing these sources requires substantial manual effort, and modalities are often missing across biological contexts. Existing pipelines commonly require evidence preparation as a separate preprocessing step, while incomplete or unavailable modalities are often not explicitly represented during inference.
 
