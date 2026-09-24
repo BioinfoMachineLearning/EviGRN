@@ -62,6 +62,12 @@ def canonical_species_label(s: str | None) -> str:
         return "human"
     if "rattus norvegicus" in x or x == "rat":
         return "rat"
+    if (
+        "drosophila melanogaster" in x
+        or x in {"drosophila", "fly", "dmel", "dm6"}
+        or x.startswith("drosophila ")
+    ):
+        return "drosophila"
     return x
 
 

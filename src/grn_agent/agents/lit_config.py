@@ -12,7 +12,7 @@ _load_dotenv()
 # Set via env var:  export NCBI_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 import os as _os
 #
-NCBI_EMAIL = "user@example.com"  # NCBI requires an email for contact info, but it does NOT affect rate limits.
+NCBI_EMAIL = _os.environ.get("NCBI_EMAIL", "user@example.com")  # NCBI requires an email for contact info, but it does NOT affect rate limits.
 NCBI_API_KEY = _os.environ.get("NCBI_API_KEY", "")
 NCBI_BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 MAX_ABSTRACTS_PER_PAIR = 40          # cap how many abstracts to fetch per TF-Target pair

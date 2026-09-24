@@ -104,6 +104,25 @@ def load_gene_coords(
 # GTF parser
 # ---------------------------------------------------------------------------
 
+def _normalize_gtf_chrom(chrom_raw: str) -> str:
+    """Normalize GTF contig names to match peak BED / GenomeDB FASTA.
+
+    Mammalian Ensembl GTFs use bare ``1``/``X``; our peak beds are UCSC
+    ``chr1``/``chrX``, so we add the ``chr`` prefix there.
+
+    Drosophila (dm6) Ensembl already uses ``2L``/``2R``/… matching the FASTA
+    and scATAC peak beds — do **not** rewrite those to ``chr2L``.
+    """
+    c = str(chrom_raw).strip()
+    if not c:
+        return c
+    if c.lower().startswith("chr"):
+        return c
+    if re.match(r"^(\d+|X|Y|M|MT)$", c, flags=re.IGNORECASE):
+        return "chr" + ("M" if c.upper() == "MT" else c)
+    return c
+
+
 def _parse_gtf(gtf_path: Path, gene_symbols: set[str] | list[str] | None) -> pd.DataFrame:
     """
     Parse a GTF/GTF.gz file and extract one TSS per gene symbol.
@@ -124,8 +143,7 @@ def _parse_gtf(gtf_path: Path, gene_symbols: set[str] | list[str] | None) -> pd.
             if feature not in ("gene", "transcript"):
                 continue
 
-            chrom_raw = parts[0].strip()
-            chrom = chrom_raw if chrom_raw.lower().startswith("chr") else f"chr{chrom_raw}"
+            chrom = _normalize_gtf_chrom(parts[0])
             start = int(parts[3])
             end = int(parts[4])
             strand = parts[6]

@@ -1,5 +1,7 @@
-"""Neural models (EAGER graph encoder + staged reasoning)."""
+"""Neural models package.
 
-from grn_agent.models.eager.eager_model import EagerRegulator, EagerRegulatorConfig
+Keep this module lightweight: importing ``grn_agent.models`` must not pull in
+optional subpackages (e.g. legacy eager) that may be absent from the tree.
+"""
 
-__all__ = ["EagerRegulator", "EagerRegulatorConfig"]
+__all__: list[str] = []

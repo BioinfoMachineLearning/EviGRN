@@ -27,8 +27,10 @@ Dependencies (must be on PATH)
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -42,6 +44,11 @@ from grn_agent.acquisition.jaspar_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Promoter scans over a full peak union (~30k peaks) exceed a 1h single-process
+# budget, so parallel chunking is the default rather than an opt-in.
+DEFAULT_FIMO_WORKERS = 8
+DEFAULT_FIMO_TIMEOUT = 3600
 
 
 def _normalize_species_for_jaspar(species_or_genome: str) -> str:
@@ -82,6 +89,8 @@ def run_motif_integration(
     pair_filter: set[tuple[str, str]] | None = None,
     keep_tmp: bool = False,
     auto_download_genome: bool = True,
+    fimo_workers: int | None = None,
+    fimo_timeout: int = DEFAULT_FIMO_TIMEOUT,
 ) -> pd.DataFrame:
     """
     Standard motif integration pipeline (bedtools + FIMO + JASPAR).
@@ -104,6 +113,8 @@ def run_motif_integration(
                            are written to the output (reduces table size).
         keep_tmp:          Keep temporary files (useful for debugging).
         auto_download_genome: Download genome from Ensembl if fasta not provided (default True).
+        fimo_workers:      Parallel FIMO chunks; None picks a CPU-bounded default.
+        fimo_timeout:      Per-chunk FIMO timeout in seconds.
 
     Returns:
         DataFrame with motif feature table.
@@ -206,9 +217,20 @@ def run_motif_integration(
         _bedtools_getfasta(promoter_bed, genome_fasta, peaks_fasta)
 
         # ── Step 6: FIMO ──────────────────────────────────────────────────
-        logger.info("Step 6 — Running FIMO (p ≤ %.0e) …", fimo_pvalue)
+        n_workers = resolve_fimo_workers(fimo_workers)
+        logger.info(
+            "Step 6 — Running FIMO (p ≤ %.0e, workers=%d, timeout=%ds) …",
+            fimo_pvalue, n_workers, fimo_timeout,
+        )
         fimo_out = tmp / "fimo_out"
-        _run_fimo(meme_filtered, peaks_fasta, fimo_out, fimo_pvalue)
+        _run_fimo(
+            meme_filtered,
+            peaks_fasta,
+            fimo_out,
+            fimo_pvalue,
+            workers=n_workers,
+            timeout=fimo_timeout,
+        )
 
         # ── Step 7: Parse & aggregate ─────────────────────────────────────
         logger.info("Step 7 — Parsing FIMO output and aggregating …")
@@ -282,11 +304,81 @@ def _bedtools_getfasta(
     logger.debug("bedtools getfasta → %d bytes", out_fasta.stat().st_size)
 
 
+def resolve_fimo_workers(requested: int | None) -> int:
+    """Clamp the requested FIMO worker count to at least 1 CPU-bounded process."""
+    cpus = os.cpu_count() or 1
+    if requested is None or int(requested) <= 0:
+        return max(1, min(DEFAULT_FIMO_WORKERS, cpus))
+    return max(1, min(int(requested), cpus))
+
+
+def _split_fasta(fasta: Path, n_parts: int, dest_dir: Path) -> list[Path]:
+    """Round-robin FASTA records into ``n_parts`` files, returning non-empty ones.
+
+    Round-robin (rather than contiguous blocks) keeps per-chunk runtime even
+    when promoter sequences vary a lot in length.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    parts = [dest_dir / f"part_{i:03d}.fa" for i in range(n_parts)]
+    handles = [p.open("w", encoding="utf-8") for p in parts]
+    counts = [0] * n_parts
+    try:
+        idx = -1
+        current = None
+        with fasta.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    idx += 1
+                    current = idx % n_parts
+                    counts[current] += 1
+                if current is None:
+                    continue
+                handles[current].write(line)
+    finally:
+        for h in handles:
+            h.close()
+    return [p for p, c in zip(parts, counts, strict=True) if c > 0]
+
+
+def _merge_fimo_tsvs(part_tsvs: list[Path], merged: Path) -> None:
+    """Concatenate FIMO TSVs, keeping a single header and dropping comments."""
+    merged.parent.mkdir(parents=True, exist_ok=True)
+    wrote_header = False
+    with merged.open("w", encoding="utf-8") as out:
+        for tsv in part_tsvs:
+            if not tsv.is_file():
+                continue
+            with tsv.open(encoding="utf-8") as fh:
+                for i, line in enumerate(fh):
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    if i == 0 or line.startswith("motif_id"):
+                        if not wrote_header:
+                            out.write(line)
+                            wrote_header = True
+                        continue
+                    out.write(line)
+
+
+def _fimo_cmd(meme_file: Path, fasta: Path, out_dir: Path, pvalue: float) -> list[str]:
+    return [
+        "fimo",
+        "--oc", str(out_dir),
+        "--thresh", str(pvalue),
+        "--no-qvalue",
+        str(meme_file),
+        str(fasta),
+    ]
+
+
 def _run_fimo(
     meme_file: Path,
     fasta: Path,
     out_dir: Path,
     pvalue: float,
+    *,
+    workers: int = 1,
+    timeout: int = DEFAULT_FIMO_TIMEOUT,
 ) -> None:
     """
     Run FIMO with standard parameters used in the field.
@@ -301,23 +393,63 @@ def _run_fimo(
         ``sequence_name`` to bare chromosome labels (e.g. ``chr1``). Downstream
         aggregation maps FIMO hits by peak IDs from BED names, so preserving
         the original header is required.
+
+    With ``workers > 1`` the FASTA is split by record and scanned in parallel,
+    then the per-chunk TSVs are concatenated. This is exact rather than an
+    approximation: ``--no-qvalue`` means no statistic is pooled across
+    sequences, so per-sequence hits do not depend on how records are batched.
+    ``timeout`` applies per chunk.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "fimo",
-        "--oc", str(out_dir),
-        "--thresh", str(pvalue),
-        "--no-qvalue",
-        str(meme_file),
-        str(fasta),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"FIMO timed out after {exc.timeout} seconds") from exc
-    if result.returncode != 0:
-        raise RuntimeError(f"FIMO failed (exit {result.returncode}):\n{result.stderr[:500]}")
-    logger.debug("FIMO stdout: %s", result.stdout[:200])
+
+    if workers <= 1:
+        try:
+            result = subprocess.run(
+                _fimo_cmd(meme_file, fasta, out_dir, pvalue),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"FIMO timed out after {exc.timeout} seconds "
+                f"(raise fimo_timeout or fimo_workers)"
+            ) from exc
+        if result.returncode != 0:
+            raise RuntimeError(f"FIMO failed (exit {result.returncode}):\n{result.stderr[:500]}")
+        logger.debug("FIMO stdout: %s", result.stdout[:200])
+        return
+
+    chunk_dir = out_dir / "chunks"
+    chunks = _split_fasta(fasta, workers, chunk_dir)
+    if not chunks:
+        raise RuntimeError(f"No FASTA records to scan in {fasta}")
+    logger.info("  FIMO parallel scan: %d chunks x %d workers", len(chunks), workers)
+
+    def _scan(chunk: Path) -> Path:
+        chunk_out = chunk_dir / f"{chunk.stem}_out"
+        try:
+            res = subprocess.run(
+                _fimo_cmd(meme_file, chunk, chunk_out, pvalue),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"FIMO chunk {chunk.name} timed out after {exc.timeout} seconds "
+                f"(raise fimo_timeout or fimo_workers)"
+            ) from exc
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"FIMO chunk {chunk.name} failed (exit {res.returncode}):\n{res.stderr[:500]}"
+            )
+        return chunk_out / "fimo.tsv"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        part_tsvs = list(pool.map(_scan, chunks))
+
+    _merge_fimo_tsvs(part_tsvs, out_dir / "fimo.tsv")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,11 +465,27 @@ def _parse_fimo(fimo_tsv: Path) -> pd.DataFrame:
         strand    score         p-value        q-value  matched_sequence
 
     Older versions may omit q-value or matched_sequence.
+
+    Important: do **not** pass ``comment='#'`` to ``read_csv``. Peak IDs may
+    contain ``#`` (e.g. ``peak#12`` after duplicate-name uniquification); pandas
+    would then truncate ``sequence_name`` at ``#`` and null out remaining fields,
+    yielding an empty table even when FIMO found hits.
     """
     if not fimo_tsv.is_file():
         return pd.DataFrame()
 
-    df = pd.read_csv(fimo_tsv, sep="\t", comment="#")
+    # Skip full-line comments only (lines beginning with '#').
+    rows: list[str] = []
+    with fimo_tsv.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            rows.append(line)
+    if not rows:
+        return pd.DataFrame()
+    from io import StringIO
+
+    df = pd.read_csv(StringIO("".join(rows)), sep="\t")
     if df.empty:
         return df
 
@@ -459,15 +607,19 @@ def _load_peaks(bed_path: Path) -> pd.DataFrame:
     else:
         # ENCODE narrowPeak BEDs often use "." for all names; those collide and
         # break peak→gene maps. Replace placeholders with coordinate IDs.
+        # Also treat generic "peak" (common when writing scored BED4/5) as a
+        # placeholder so we never uniquify to "peak#N" — the "#" breaks FIMO
+        # parsers that treat "#" as a comment character.
         name_str = df["name"].astype(str).str.strip()
-        bad_name = name_str.isin({"", ".", "nan", "NA", "N/A", "null", "None"})
+        bad_name = name_str.isin({"", ".", "nan", "NA", "N/A", "null", "None", "peak"})
         df.loc[bad_name, "name"] = coord_id[bad_name]
 
     # Ensure name uniqueness so each peak can be mapped independently.
+    # Use "_" (not "#") so IDs remain safe for comment-aware TSV parsers.
     dup_mask = df["name"].duplicated(keep=False)
     if dup_mask.any():
         dup_idx = df.groupby("name").cumcount().astype(str)
-        df.loc[dup_mask, "name"] = df.loc[dup_mask, "name"] + "#" + dup_idx[dup_mask]
+        df.loc[dup_mask, "name"] = df.loc[dup_mask, "name"] + "_" + dup_idx[dup_mask]
     return df
 
 

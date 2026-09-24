@@ -166,6 +166,9 @@ def _load_base_tf_config(master: dict[str, Any]) -> dict[str, Any]:
         "disable_priors",
         "use_ortholog_lookup",
         "multimodal_manifest",
+        "build_device",
+        "prior_device",
+        "tf_workers",
     ):
         if key in master:
             base[key] = copy.deepcopy(master[key])

@@ -81,16 +81,43 @@ class TfEagerWindowModel(nn.Module):
             h = h + self.ctx_token_emb(batch.context_idx.clamp(0, max(1, self.cfg.context_vocab) - 1)).unsqueeze(1).expand(b, n, d)
         return h * batch.token_mask.unsqueeze(-1)
 
-    def _attend(self, z: torch.Tensor, h: torch.Tensor, allow_mask: torch.Tensor, valid_mask: torch.Tensor, layer: nn.MultiheadAttention) -> torch.Tensor:
+    def _attend(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        allow_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        layer: nn.MultiheadAttention,
+        *,
+        need_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         allow = (allow_mask > 0.5) & (valid_mask > 0.5)
         fallback = valid_mask > 0.5
         no_allow = allow.sum(dim=1, keepdim=True) <= 0
         allow = torch.where(no_allow, fallback, allow)
         key_padding_mask = ~allow
-        out, _ = layer(z, h, h, key_padding_mask=key_padding_mask, need_weights=False)
-        return out
+        out, weights = layer(
+            z,
+            h,
+            h,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            average_attn_weights=True,
+        )
+        return out, (weights if need_weights else None)
 
-    def forward(self, batch: TfEagerWindowBatch) -> torch.Tensor:
+    def forward(
+        self,
+        batch: TfEagerWindowBatch,
+        *,
+        return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor | None]]:
+        """Score candidate genes in a TF-centered window.
+
+        When ``return_attention`` is True, also return average cross-attention
+        maps for each decoder stage (analysis / interpretability only; no effect
+        on training or default inference logits).
+        """
         h0 = self._initial_memory(batch)
         h = self.encoder(h0, src_key_padding_mask=(batch.token_mask <= 0.5))
         h = h * batch.token_mask.unsqueeze(-1)
@@ -106,23 +133,38 @@ class TfEagerWindowModel(nn.Module):
             z = z + self.ctx_query_emb(batch.context_idx.clamp(0, max(1, self.cfg.context_vocab) - 1)).unsqueeze(1).expand(b, w, d)
         z = z * batch.gene_mask.unsqueeze(-1)
 
+        attn: dict[str, torch.Tensor | None] = {
+            "stage1": None,
+            "stage2": None,
+            "stage3": None,
+        }
+
         if str(self.cfg.decoder_mode or "staged").strip().lower() == "single_stage":
-            s = self._attend(z, h, batch.token_mask, batch.token_mask, self.stage3)
+            s, w3 = self._attend(z, h, batch.token_mask, batch.token_mask, self.stage3, need_weights=return_attention)
+            attn["stage3"] = w3
             z3 = self.ln3(z + self.dropout(s))
             z = z3 + self.dropout(self.ff3(z3))
-            return self.head(z).squeeze(-1)
+            logits = self.head(z).squeeze(-1)
+            return (logits, attn) if return_attention else logits
 
         mech_available = ((batch.modality[:, 1] + batch.modality[:, 2] + batch.modality[:, 3]) > 0.5).float().view(b, 1, 1)
         if bool(mech_available.any().item()):
-            s1 = self._attend(z, h, batch.mech_mask, batch.token_mask, self.stage1) * mech_available
+            s1, w1 = self._attend(
+                z, h, batch.mech_mask, batch.token_mask, self.stage1, need_weights=return_attention
+            )
+            attn["stage1"] = w1
+            s1 = s1 * mech_available
             z1 = self.ln1(z + self.dropout(s1))
             z = z1 + self.dropout(self.ff1(z1))
 
-        s2 = self._attend(z, h, batch.func_mask, batch.token_mask, self.stage2)
+        s2, w2 = self._attend(z, h, batch.func_mask, batch.token_mask, self.stage2, need_weights=return_attention)
+        attn["stage2"] = w2
         z2 = self.ln2(z + self.dropout(s2))
         z = z2 + self.dropout(self.ff2(z2))
 
-        s3 = self._attend(z, h, batch.token_mask, batch.token_mask, self.stage3)
+        s3, w3 = self._attend(z, h, batch.token_mask, batch.token_mask, self.stage3, need_weights=return_attention)
+        attn["stage3"] = w3
         z3 = self.ln3(z + self.dropout(s3))
         z = z3 + self.dropout(self.ff3(z3))
-        return self.head(z).squeeze(-1)
+        logits = self.head(z).squeeze(-1)
+        return (logits, attn) if return_attention else logits

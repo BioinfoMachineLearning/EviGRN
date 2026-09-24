@@ -65,6 +65,10 @@ def build_multimodal_manifest(
             "database": motif_meta.get("database", "JASPAR2026"),
             "tf_motif_count": motif_meta.get("tf_motif_count", 0),
             "tf_overlap_with_rnaseq": motif_meta.get("tf_overlap_with_rnaseq", 0.0),
+            # Surface scan failures: a dropped motif channel silently degrades
+            # downstream scoring to expression+accessibility only.
+            "status": motif_meta.get("status", "unknown"),
+            "error": motif_meta.get("error"),
         },
         "qc": qc_report,
         "qc_report": qc_report,

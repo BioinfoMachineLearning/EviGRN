@@ -180,6 +180,40 @@ def _infer_request_geo_accessions(args: argparse.Namespace) -> list[str]:
     )
 
 
+def _write_ranked_candidates(path: str | None, ranked: list[tuple]) -> None:
+    """Write the top accessibility QC rankings without downloading files."""
+    if not path:
+        return
+    rows = []
+    for rank, item in enumerate(ranked, start=1):
+        meta, score, detail = item
+        meta = meta if isinstance(meta, dict) else {}
+        detail = detail if isinstance(detail, dict) else {}
+        try:
+            score_f = float(score)
+        except (TypeError, ValueError):
+            score_f = None
+        rows.append(
+            {
+                "rank": rank,
+                "accession": meta.get("accession"),
+                "source": meta.get("source"),
+                "assay": meta.get("assay"),
+                "cell_type": meta.get("cell_type"),
+                "genome_build": meta.get("genome_build"),
+                "n_replicates": meta.get("n_replicates"),
+                "score": score_f,
+                "tier": detail.get("tier"),
+                "s_bio": detail.get("s_bio"),
+                "s_cond": detail.get("s_cond"),
+                "s_quality": detail.get("s_quality"),
+            }
+        )
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Acquire multimodal data with automatic ATAC/DNase search",
@@ -284,6 +318,16 @@ Examples:
     parser.add_argument("--skip-atac-search", action="store_true", help="Skip automatic ATAC search (RNA-only mode)")
     parser.add_argument("--max-atac-candidates", type=int, default=5, help="Max ATAC candidates to evaluate (default: 5)")
     parser.add_argument(
+        "--ranked-candidates-json",
+        default="",
+        help="Write the ranked accessibility candidates (top --max-atac-candidates) as JSON",
+    )
+    parser.add_argument(
+        "--rank-only",
+        action="store_true",
+        help="Rank accessibility candidates and exit before download, motif scan, or manifest writing",
+    )
+    parser.add_argument(
         "--geo-search-workers",
         type=int,
         default=6,
@@ -322,6 +366,15 @@ Examples:
         help="FIMO p-value threshold (default: 1e-4, standard field practice)",
     )
     parser.add_argument(
+        "--fimo-workers", type=int, default=0,
+        help="Parallel FIMO chunks (0 = CPU-bounded default). Full peak unions "
+             "need >1 to finish within the timeout.",
+    )
+    parser.add_argument(
+        "--fimo-timeout", type=int, default=3600,
+        help="Per-chunk FIMO timeout in seconds (default: 3600)",
+    )
+    parser.add_argument(
         "--jaspar-release",
         type=int,
         default=2026,
@@ -339,7 +392,13 @@ Examples:
     # Auto-infer genome build if not provided
     genome = args.genome
     if not genome:
-        genome_map = {"mouse": "mm10", "human": "hg38", "rat": "rn6"}
+        genome_map = {
+            "mouse": "mm10",
+            "human": "hg38",
+            "rat": "rn6",
+            "drosophila": "dm6",
+            "fly": "dm6",
+        }
         genome = genome_map.get(args.species.lower(), "unknown")
         logger.info(f"Auto-inferred genome build: {genome}")
     
@@ -546,7 +605,13 @@ Examples:
         logger.info("Searching for ATAC/DNase-seq data (ENCODE + GEO)...")
         encode = ENCODEClient(cache_dir=cache / "encode")
         geo = GEOClient(cache_dir=cache / "geo")
-        organism_map = {"mouse": "Mus musculus", "human": "Homo sapiens", "rat": "Rattus norvegicus"}
+        organism_map = {
+            "mouse": "Mus musculus",
+            "human": "Homo sapiens",
+            "rat": "Rattus norvegicus",
+            "drosophila": "Drosophila melanogaster",
+            "fly": "Drosophila melanogaster",
+        }
         organism = organism_map.get(args.species.lower(), args.species)
         
         candidates: list[tuple[dict, float, dict]] = []
@@ -890,7 +955,8 @@ Examples:
                 )
             # Log top-5 from full candidate list for diagnostics
             candidates_sorted_all = sorted(candidates, key=_candidate_sort_key)
-            for i, (m, s, d) in enumerate(candidates_sorted_all[:5], start=1):
+            ranked_limit = max(1, int(args.max_atac_candidates))
+            for i, (m, s, d) in enumerate(candidates_sorted_all[:ranked_limit], start=1):
                 logger.info(
                     "Ranked candidate #%d: %s assay=%s score=%.3f tier=%s "
                     "cell_type=%s s_bio=%.2f s_cond=%.2f s_quality=%.2f",
@@ -904,8 +970,22 @@ Examples:
                     d.get("s_cond", 0.0),
                     d.get("s_quality", 0.0),
                 )
+            _write_ranked_candidates(
+                str(args.ranked_candidates_json or ""),
+                candidates_sorted_all[:ranked_limit],
+            )
+            if args.rank_only:
+                logger.info("rank-only: wrote accessibility candidates and stopped before download")
+                return
         else:
             logger.warning("No ATAC/DNase data found in ENCODE")
+
+    if args.rank_only:
+        ranked_path = str(args.ranked_candidates_json or "")
+        if ranked_path and not Path(ranked_path).is_file():
+            _write_ranked_candidates(ranked_path, [])
+        logger.info("rank-only: stopped before download and harmonization")
+        return
     
     if not accessibility_meta:
         logger.warning("No accessibility data available; creating RNA-only manifest")
@@ -1010,8 +1090,27 @@ Examples:
                         "Downloading GEO supplementary peak file for integration: %s",
                         peak_url[:160] + ("…" if len(peak_url) > 160 else ""),
                     )
-                    GEOClient(cache_dir=cache / "geo").download_supplementary_file(peak_url, local_peaks)
-                    accessibility_meta["files"] = [str(local_peaks.resolve())]
+                    _download_geo_supplementary(
+                        GEOClient(cache_dir=cache / "geo"), peak_url, local_peaks
+                    )
+                    resolved = local_peaks.resolve()
+                    if _geo_file_is_peak_count_matrix(str(resolved)):
+                        bed_out = out_dir_geo / "peaks_from_fragment_counts.bed"
+                        n_peaks = _convert_peak_count_matrix_to_bed(resolved, bed_out)
+                        if n_peaks < 100:
+                            raise RuntimeError(
+                                f"Peak-count matrix converted to only {n_peaks} intervals"
+                            )
+                        logger.info(
+                            "Converted GEO peak×cell matrix → BED: %d peaks → %s",
+                            n_peaks,
+                            bed_out,
+                        )
+                        accessibility_meta["files"] = [str(bed_out.resolve())]
+                        accessibility_meta["peak_source_matrix"] = str(resolved)
+                    else:
+                        accessibility_meta["files"] = [str(resolved)]
+                    accessibility_meta["has_peak_file"] = True
                 except Exception as exc:
                     logger.warning(
                         "Failed to download GEO peak file from %s: %s",
@@ -1217,6 +1316,8 @@ Examples:
                     gene_cache_dir=cache / "gene_coords",
                     pair_filter=None,
                     auto_download_genome=auto_genome,
+                    fimo_workers=args.fimo_workers,
+                    fimo_timeout=args.fimo_timeout,
                 )
                 if not motif_df.empty:
                     motif_df["source_tf"] = motif_df["source_tf"].astype(str).str.strip().str.upper()
@@ -1563,10 +1664,18 @@ def _extract_cell_line_from_text(*texts: str) -> str:
                 m = re.search(cp, seg, flags=re.IGNORECASE)
                 if m:
                     return str(m.group(0)).strip()
+    # Multiome / barnyard GEO titles often encode the line as an underscore
+    # token (e.g. scATAC_mESC_K562) without a "cell line" cue nearby.
+    for m in re.finditer(
+        r"(?:^|[_\-/])([A-Za-z]{1,4}\d{2,4}[A-Za-z]?)(?=$|[_\-/\s])",
+        blob,
+    ):
+        tok = str(m.group(1)).strip()
+        if len(tok) >= 3:
+            return tok
     # No unconstrained fallback: standalone alnum tokens in summaries can be genes
     # (e.g., SOX17) and should not be interpreted as cell-line identifiers.
     return ""
-
 
 def _assign_tier(score_01: float) -> str:
     """Map a normalised [0,1] composite score to a selection tier."""
@@ -1919,6 +2028,11 @@ def _score_accessibility_candidate(
     if requested_cell_line:
         req_line = _norm_cell_line(requested_cell_line)
         meta_line = _norm_cell_line(str(meta.get("cell_line") or ""))
+        # Rescue line tokens buried in multiome titles/summaries
+        # (e.g. scATAC_mESC_K562) when structured cell_line is empty.
+        if req_line and not meta_line and req_line in _norm_cell_line(context_blob):
+            meta_line = req_line
+            why["cell_line_from_context"] = True
         if req_line and not meta_line:
             why["cell_line_missing"] = True
         elif req_line and meta_line:
@@ -1935,6 +2049,17 @@ def _score_accessibility_candidate(
                 s_bio = 0.00
                 why["s_bio"] = s_bio
 
+    # Prefer real ATAC / multiome over ADT/HTO library titles when the
+    # request context asks for paired scATAC / multiome accessibility.
+    req_ctx_lc = str(requested_cell_context or "").lower()
+    title_lc = " ".join(
+        str(meta.get(k) or "") for k in ("description", "biosample_summary", "cell_type")
+    ).lower()
+    wants_atac = any(tok in req_ctx_lc for tok in ("scatac", "atac", "multiome", "dnase"))
+    if wants_atac and any(tok in title_lc for tok in ("scadt", "sc_hto", "schto", "adt_", "hto_")):
+        s_assay = min(float(s_assay), 0.10)
+        why["s_assay"] = s_assay
+        why["adt_hto_assay_penalty"] = True
     # =========================================================
     # Lineage hint  (soft booster for s_bio when lineage given)
     # =========================================================
@@ -2241,29 +2366,40 @@ def _extract_accessibility_meta(exp: dict, genome: str) -> dict:
 
 
 def _pick_geo_peak_file_url(urls: list[str]) -> str | None:
-    """Pick a supplementary file URL that is likely a peak BED/narrowPeak (not BigWig/BAM)."""
+    """Pick a supplementary file URL usable as peaks (BED/narrowPeak or peak×cell counts).
+
+    Prefer classical peak calls. Fall back to scATAC peak×cell matrices
+    (``*fragment_counts*.tsv.gz``, ``*peak*counts*``) which can be converted to BED.
+    Skip BigWig/BAM and RNA count matrices.
+    """
     scored: list[tuple[int, str]] = []
     for raw in urls:
         u = str(raw or "").strip()
         if not u:
             continue
         low = u.lower()
-        if any(bad in low for bad in ("bigwig", ".bw", ".bam", ".bai", "matrix", "count", "fpkm")):
+        name = low.rsplit("/", 1)[-1]
+        if any(bad in low for bad in ("bigwig", ".bw", ".bam", ".bai", "fpkm", "tpm")):
             continue
-        if not any(
-            ext in low
-            for ext in ("bed", "narrowpeak", "broadpeak", "peaks", "peak_", "_peaks")
-        ):
+        # Raw 10x fragments are not a peak universe by themselves.
+        if "fragments.tsv" in name and "fragment_counts" not in name and "peak" not in name:
             continue
         score = 0
         if "narrowpeak" in low:
             score += 25
         elif "broadpeak" in low:
             score += 20
-        elif "peaks" in low or "_peak" in low:
-            score += 15
         elif ".bed" in low:
-            score += 10
+            score += 18
+        elif "fragment_counts" in name or "peak_counts" in name or "peakcount" in name:
+            # Peak×cell count matrix — convertible to BED intervals.
+            score += 14
+        elif ("peaks" in low or "_peak" in low) and any(
+            ext in low for ext in (".tsv", ".txt", ".csv", ".bed", ".gz")
+        ):
+            score += 12
+        else:
+            continue
         if low.endswith(".gz") or low.endswith(".bgz"):
             score += 3
         scored.append((score, u))
@@ -2271,6 +2407,85 @@ def _pick_geo_peak_file_url(urls: list[str]) -> str | None:
         return None
     scored.sort(key=lambda x: (-x[0], -len(x[1])))
     return scored[0][1]
+
+
+def _geo_download_cgi_url(url: str) -> str:
+    """Map a GEO sample supplementary FTP path to the ``geo/download`` CGI form."""
+    from urllib.parse import quote, urlparse
+
+    parsed = urlparse(str(url or ""))
+    if not parsed.netloc.lower().endswith("ncbi.nlm.nih.gov"):
+        return ""
+    m = re.search(r"/geo/samples/[^/]+/(GSM\d+)/suppl/(.+)$", parsed.path, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    return (
+        "https://www.ncbi.nlm.nih.gov/geo/download/"
+        f"?acc={m.group(1).upper()}&format=file&file={quote(m.group(2), safe='')}"
+    )
+
+
+def _download_geo_supplementary(client: GEOClient, url: str, dest: Path) -> None:
+    """Download a GEO supplementary file, falling back to the download CGI.
+
+    The FTP mirror intermittently answers 403 for sample supplementary files
+    that the CGI endpoint still serves.
+    """
+    try:
+        client.download_supplementary_file(url, dest)
+        return
+    except Exception as exc:
+        cgi_url = _geo_download_cgi_url(url)
+        if not cgi_url:
+            raise
+        logger.warning("GEO FTP download failed (%s); retrying via download endpoint", exc)
+    client.download_supplementary_file(cgi_url, dest)
+
+
+def _geo_file_is_peak_count_matrix(path_or_url: str) -> bool:
+    name = str(path_or_url).lower().rsplit("/", 1)[-1]
+    return any(
+        tok in name
+        for tok in ("fragment_counts", "peak_counts", "peakcount", "peak_matrix", "peaks_matrix")
+    )
+
+
+def _convert_peak_count_matrix_to_bed(matrix_path: Path, bed_out: Path) -> int:
+    """Write unique chrom/start/end intervals from a peak×cell count matrix index."""
+    import gzip
+    import re
+
+    opener = gzip.open if str(matrix_path).endswith(".gz") else open
+    seen: set[tuple[str, int, int]] = set()
+    rows: list[tuple[str, int, int]] = []
+    with opener(matrix_path, "rt", encoding="utf-8", errors="replace") as fh:
+        header = fh.readline()  # noqa: F841 — skip barcode header
+        for line in fh:
+            peak_id = line.split("\t", 1)[0].strip().strip('"')
+            if not peak_id:
+                continue
+            chrom = start = end = None
+            if ":" in peak_id and "-" in peak_id:
+                chrom, rest = peak_id.split(":", 1)
+                a, b = rest.split("-", 1)
+                start, end = int(a), int(b)
+            elif peak_id.count("-") >= 2:
+                chrom, a, b = peak_id.split("-", 2)
+                if re.fullmatch(r"\d+", a) and re.fullmatch(r"\d+", b):
+                    start, end = int(a), int(b)
+            if chrom is None or start is None or end is None:
+                continue
+            if end < start:
+                start, end = end, start
+            key = (chrom, start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(key)
+    rows.sort(key=lambda x: (x[0], x[1], x[2]))
+    bed_out.parent.mkdir(parents=True, exist_ok=True)
+    bed_out.write_text("".join(f"{c}\t{s}\t{e}\n" for c, s, e in rows), encoding="utf-8")
+    return len(rows)
 
 
 def _geo_sample_text(sample_meta: dict) -> str:

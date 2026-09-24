@@ -75,23 +75,10 @@ def load_tf_eager_checkpoint(path: str | Path, device: str | torch.device) -> Tf
 
 
 def _edge_reasoning(row: dict[str, Any]) -> str:
-    tf = row["source_tf"]
-    gene = row["target_gene"]
-    p = float(row["p_present"])
-    corr = row.get("correlation")
-    motif = row.get("motif_present")
-    acc = row.get("accessibility")
-    prior = row.get("ensemble_prior")
-    parts = [f"tf-eager predicts {tf}->{gene} with p_present={p:.3f}."]
-    if corr is not None:
-        parts.append(f"correlation={float(corr):.3f}.")
-    if motif is not None:
-        parts.append(f"motif_present={bool(motif)}.")
-    if acc is not None:
-        parts.append(f"accessibility={float(acc):.3f}.")
-    if prior is not None:
-        parts.append(f"ensemble_prior={float(prior):.3f}.")
-    return " ".join(parts)
+    """Deterministic scientific rationale from evidence fields (no model change)."""
+    from grn_agent.explain.reasoning import build_edge_explanation
+
+    return str(build_edge_explanation(row)["mechanism_reasoning"])
 
 
 def score_windows(

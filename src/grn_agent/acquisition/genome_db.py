@@ -73,8 +73,8 @@ _REGISTRY: list[_GenomeBuild] = [
     # Zebrafish
     _GenomeBuild("danRer11", "zebrafish", "danio_rerio",          "GRCz11",    109, "danRer11",   7955),
     _GenomeBuild("danRer10", "zebrafish", "danio_rerio",          "GRCz10",     91, "danRer10",   7955),
-    # Drosophila
-    _GenomeBuild("dm6",   "drosophila", "drosophila_melanogaster","BDGP6.46",  109, "dm6",        7227),
+    # Drosophila (BDGP6.46 toplevel first appears at Ensembl 110; 109 still has BDGP6.32)
+    _GenomeBuild("dm6",   "drosophila", "drosophila_melanogaster","BDGP6.46",  110, "dm6",        7227),
     # C. elegans
     _GenomeBuild("ce11",  "worm",       "caenorhabditis_elegans", "WBcel235",  109, "ce11",       6239),
     # Arabidopsis

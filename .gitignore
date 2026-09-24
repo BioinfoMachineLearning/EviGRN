@@ -25,8 +25,40 @@ legacy_old/
 GenomeDatabase/
 docs/manuscript/
 docs/figures/
+docs/figures_and_tables/
 archives/
+
+# Manuscript figures, tables, and the scripts that build them.
+# Ship these as a supplementary zip. The general-use repo keeps
+# train / infer / eval, the UI, sample configs, and sample checkpoints.
+scripts/rebuttal_*.py
+scripts/build_iclr_*.py
+scripts/build_docs_iclr_figures_tables.py
+scripts/build_mech_weakcorr_*.py
+scripts/build_lit_figure.py
+scripts/build_acquisition_*.py
+scripts/analyze_fair_benchmark_heatmaps.py
+scripts/benchmark_fair_*.py
+scripts/eval_baseline_fair_pools.py
+scripts/eval_multimodal_acquisition_benchmark.py
+scripts/run_baseline_fair_grid.py
+scripts/run_scenicplus_baseline.py
+scripts/run_celloracle_baseline.py
+scripts/collect_tf_eager_eval_tables.py
+scripts/compare_tf_eager_neg_models.py
+scripts/summarize_tf_eager_ablation.py
+scripts/plot_tf_eager_ablation_heatmap.py
+scripts/plot_tf_eager_eval_metrics.py
+scripts/generate_beeline_atac_table.py
+scripts/acquire_multimodal_data_fragaware.py
+scripts/baselines/
+scripts/figr_pbmc/
+scripts/interpretability/
+scripts/trackB/
+scripts/_tmp_*
+scripts/from pptx import Presentation.py
 .pytest_cache/
 Literature_Validation_Agent/.venv/
 .kube/
 .ruff_cache/
+third_party/
